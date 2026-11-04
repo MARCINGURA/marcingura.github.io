@@ -1,0 +1,726 @@
+---
+title: "Analiza statystyczna zależności między parametrami eksploatacyjnymi a występowaniem awarii maszyn przemysłowych"
+subtitle: "Raport na zaliczenie ze statystyki stosowanej — zbiór AI4I 2020"
+author: "Marcin Górski"
+date: last-modified
+lang: pl
+bibliography: bibliografia.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# Biblioteki wymagane do wygenerowania raportu:
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(pROC)
+
+if (!file.exists("ai4i2020.csv")) {
+  stop("Brak pliku ai4i2020.csv. Umieść go w tym samym folderze co index.qmd.")
+}
+
+surowe <- read.csv("ai4i2020.csv", stringsAsFactors = FALSE)
+wymagane <- c(
+  "Type", "Air.temperature..K.", "Process.temperature..K.",
+  "Rotational.speed..rpm.", "Torque..Nm.", "Tool.wear..min.",
+  "Machine.failure"
+)
+stopifnot(all(wymagane %in% names(surowe)))
+stopifnot(!anyNA(surowe[, wymagane]))
+stopifnot(all(surowe$Machine.failure %in% c(0, 1)))
+stopifnot(all(surowe$Type %in% c("L", "M", "H")))
+
+# W analizie wykorzystujemy wyłącznie zmienne znane przed awarią.
+# Kolumny TWF, HDF, PWF, OSF, RNF ujawniają tryb awarii
+# i nie mogą służyć do predykcji Machine.failure.
+dane <- data.frame(
+  Awaria = factor(
+    ifelse(surowe$Machine.failure == 1, "Awaria", "Brak awarii"),
+    levels = c("Brak awarii", "Awaria")
+  ),
+  Type = factor(surowe$Type, levels = c("L", "M", "H")),
+  Temp_otoczenia = surowe$Air.temperature..K.,
+  Temp_procesu = surowe$Process.temperature..K.,
+  Predkosc = surowe$Rotational.speed..rpm.,
+  Moment = surowe$Torque..Nm.,
+  Zuzycie = surowe$Tool.wear..min.
+)
+
+barwy <- c("Brak awarii" = "#277A72", "Awaria" = "#B96338")
+liczba_awarii <- sum(dane$Awaria == "Awaria")
+liczba_bez_awarii <- sum(dane$Awaria == "Brak awarii")
+
+# Warstwowy podział przed analizami zależności, aby odłożyć
+# testową część danych wyłącznie do końcowej oceny predykcji.
+set.seed(123)
+grupy <- split(seq_len(nrow(dane)), dane$Awaria)
+indeks_trening <- sort(unlist(lapply(grupy, function(ix) {
+  sample(ix, size = floor(0.8 * length(ix)))
+}), use.names = FALSE))
+trening <- dane[indeks_trening, , drop = FALSE]
+testowy <- dane[-indeks_trening, , drop = FALSE]
+
+# Pomocnicze formatowanie wyniku p.
+fmt_p <- function(x) {
+  if (length(x) == 0L || is.na(x)) return("brak")
+  format.pval(x, digits = 3, eps = 0.001)
+}
+
+# Odsetek średniej precyzji — miara przydatna przy rzadkich awariach.
+average_precision <- function(y, p) {
+  y <- as.integer(y == "Awaria")
+  ix <- order(p, decreasing = TRUE)
+  y <- y[ix]
+  if (sum(y) == 0L) return(NA_real_)
+  mean((cumsum(y) / seq_along(y))[y == 1L])
+}
+
+bezpieczny_ulamek <- function(a, b) {
+  if (b == 0) return(NA_real_)
+  a / b
+}
+```
+
+# Wprowadzenie
+
+Predykcyjne utrzymanie ruchu (*predictive maintenance*) wykorzystuje dane o stanie technicznym i parametrach pracy urządzeń do rozpoznawania warunków związanych z awariami. W zastosowaniach przemysłowych istotne jest nie tylko przewidywanie zdarzeń, lecz także określenie, które parametry wiążą się z ich występowaniem.
+
+W niniejszym raporcie analizowany jest publiczny, **syntetyczny** zbiór AI4I 2020. Wyniki opisują zależności obecne w tym zbiorze i nie mogą być automatycznie uogólniane na rzeczywistą linię produkcyjną. Zgodnie z informacjami repozytorium UCI zbiór zawiera `r nrow(dane)` obserwacji i sześć podstawowych zmiennych objaśniających [@uci].
+
+# Cel badawczy
+
+**Celem głównym badania** jest identyfikacja i ocena statystycznych związków między parametrami eksploatacyjnymi a występowaniem awarii maszyn przemysłowych oraz oszacowanie szans awarii z wykorzystaniem wieloczynnikowej regresji logistycznej.
+
+Celami szczegółowymi są: opisanie rozkładu awarii, ocena związków z poszczególnymi predyktorami, porównanie kilku zagnieżdżonych modeli, wybór modelu końcowego oraz ocena jego jakości na danych testowych.
+
+# Zmienna objaśniana i zmienne objaśniające
+
+Zmienną objaśnianą jest **wystąpienie awarii** (`Machine.failure`), kodowane jako 0 — brak awarii i 1 — awaria. Zmienne objaśniające zestawiono poniżej.
+
+| Zmienna | Typ | Jednostka / poziomy |
+|:--|:--|:--|
+| Typ produktu (`Type`) | Kategoryczna | L, M, H (kategorią referencyjną jest L) |
+| Temperatura otoczenia | Ciągła | K |
+| Temperatura procesu | Ciągła | K |
+| Prędkość obrotowa | Ilościowa | obr./min |
+| Moment obrotowy | Ciągła | Nm |
+| Zużycie narzędzia | Ilościowa | min |
+
+Identyfikatory `UDI` i `Product.ID` nie są predyktorami. Znaczniki trybów awarii `TWF`, `HDF`, `PWF`, `OSF` i `RNF` wyłączono, ponieważ zawierają informację o wystąpieniu i rodzaju awarii; ich zastosowanie skutkowałoby przeciekiem informacji o zmiennej wynikowej.
+
+# Problemy badawcze
+
+**Główny problem badawczy:** które parametry eksploatacyjne wykazują statystyczny związek z wystąpieniem awarii i jak zmieniają się oszacowane szanse awarii wraz z ich zmianą?
+
+Problemy szczegółowe:
+
+1. Czy częstość awarii różni się między kategoriami produktu L, M i H?
+2. Czy rozkłady temperatury otoczenia, temperatury procesu, prędkości obrotowej, momentu obrotowego i zużycia narzędzia różnią się między obserwacjami z awarią i bez awarii?
+3. Czy dodanie kolejnych grup predyktorów poprawia dopasowanie modelu zgodnie z AIC i testem ilorazu wiarygodności?
+4. Które współczynniki modelu końcowego są nominalnie istotne statystycznie i jaka jest ich interpretacja poprzez iloraz szans (OR)?
+5. Jaką skuteczność wykrywania awarii uzyskuje model na niewykorzystanej podczas estymacji próbie testowej?
+
+Przyjęto poziom istotności \(\alpha=0{,}05\). Interpretację prowadzono w kategoriach **związku statystycznego, a nie przyczynowości**.
+
+# Jednostka obserwacji
+
+Jednostką analizy jest pojedynczy, syntetycznie wygenerowany rekord opisujący zestaw parametrów eksploatacyjnych maszyny oraz informację o wystąpieniu awarii. Zbiór obejmuje `r nrow(dane)` rekordów; nie należy interpretować tej liczby jako liczby odrębnych maszyn fizycznych.
+
+# Dlaczego zastosowano regresję logistyczną?
+
+Regresja logistyczna jest odpowiednia, ponieważ zmienna objaśniana jest binarna. W przeciwieństwie do klasycznej regresji liniowej modeluje ona prawdopodobieństwo zdarzenia ograniczone do przedziału od 0 do 1. Dopuszcza jednoczesne uwzględnienie zmiennych ilościowych i kategorycznych, a parametry można interpretować jako ilorazy szans [@hosmer].
+
+Dla prawdopodobieństwa awarii \(p\) przyjęto model:
+
+\[
+\log\left(\frac{p}{1-p}\right)
+= \beta_0 + \beta_1 X_1 + \dots + \beta_k X_k,
+\qquad
+p=\frac{e^{\eta}}{1+e^{\eta}}.
+\]
+
+Współczynniki szacowane są metodą największej wiarygodności. Wartość \(e^{\beta_j}\) oznacza iloraz szans odpowiadający jednostkowej zmianie predyktora \(X_j\) przy stałych pozostałych zmiennych. Nie jest to bezpośredni iloraz prawdopodobieństw.
+
+Podstawą metodyczną jest książka D. W. Hosmera, S. Lemeshowa i R. X. Sturdivanta *Applied Logistic Regression* (wyd. 3, 2013) [@hosmer].
+
+# Rozkład zmiennej objaśnianej
+
+```{r}
+#| label: tbl-rozklad
+#| tbl-cap: "Rozkład zmiennej objaśnianej w całym zbiorze AI4I 2020"
+
+rozklad <- data.frame(
+  Stan = names(table(dane$Awaria)),
+  Liczba = as.integer(table(dane$Awaria)),
+  Procent = round(100 * as.numeric(prop.table(table(dane$Awaria))), 2)
+)
+knitr::kable(rozklad)
+```
+
+```{r}
+#| label: fig-rozklad
+#| fig-cap: "Liczebność obserwacji według wystąpienia awarii"
+#| fig-width: 8
+#| fig-height: 5
+
+ggplot(dane, aes(x = Awaria, fill = Awaria)) +
+  geom_bar(width = 0.55) +
+  geom_text(stat = "count", aes(label = after_stat(count)),
+            vjust = -0.5, size = 4.5) +
+  scale_fill_manual(values = barwy) +
+  expand_limits(y = max(table(dane$Awaria)) * 1.10) +
+  labs(x = "Stan maszyny", y = "Liczba obserwacji") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+Awarie stanowią `r round(100 * liczba_awarii / nrow(dane), 2)`% wszystkich przypadków (`r liczba_awarii` z `r nrow(dane)`). Tak silna nierównowaga oznacza, że sama dokładność klasyfikacji może być myląca. Z tego powodu w dalszej części przedstawiono również czułość, precyzję i średnią precyzję (AP).
+
+# Czynniki kategoryczne a występowanie awarii
+
+Jedynym badanym predyktorem kategorycznym jest typ produktu (`Type`). Analizę związku między typem produktu a wystąpieniem awarii przeprowadzono na **próbie treningowej** — próba testowa zostaje odłożona do niezależnej oceny modelu.
+
+```{r}
+#| label: tbl-typ
+#| tbl-cap: "Liczebność i odsetek awarii według typu produktu — próba treningowa"
+
+tabela_typ <- trening %>%
+  group_by(Type) %>%
+  summarise(
+    Liczba = n(),
+    Awarie = sum(Awaria == "Awaria"),
+    `Awaryjność [%]` = round(100 * mean(Awaria == "Awaria"), 2),
+    .groups = "drop"
+  )
+knitr::kable(tabela_typ)
+```
+
+```{r}
+#| label: fig-typ
+#| fig-cap: "Odsetek obserwacji z awarią według typu produktu"
+
+ggplot(tabela_typ, aes(x = Type, y = `Awaryjność [%]`)) +
+  geom_col(fill = "#277A72", width = 0.6) +
+  geom_text(aes(label = paste0(`Awaryjność [%]`, "%")),
+            vjust = -0.4) +
+  expand_limits(y = max(tabela_typ$`Awaryjność [%]`) * 1.17) +
+  labs(x = "Typ produktu", y = "Odsetek awarii [%]") +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+#| label: test-chi-kwadrat
+
+kontyngencja <- table(trening$Type, trening$Awaria)
+test_chi <- chisq.test(kontyngencja)
+cat("Test niezależności chi-kwadrat: X² =",
+    round(unname(test_chi$statistic), 3),
+    ", df =", unname(test_chi$parameter),
+    ", p =", fmt_p(test_chi$p.value), "\n")
+cat("Minimalna liczebność oczekiwana:",
+    round(min(test_chi$expected), 2), "\n")
+```
+
+Hipoteza zerowa testu \(\chi^2\) zakłada niezależność typu produktu i wystąpienia awarii. Uzyskano \(p =\) `r fmt_p(test_chi$p.value)`. Sam wynik testu nie przesądza o sile zależności i nie zastępuje analizy wieloczynnikowej.
+
+# Zmienne ciągłe a występowanie awarii
+
+Dla pięciu predyktorów ilościowych zestawiono mediany, średnie oraz odchylenia standardowe w obu klasach. Rozkłady porównano testem Manna–Whitneya, a wartości \(p\) dla pięciu porównań skorygowano procedurą Benjamini–Hochberga. Testy te mają charakter eksploracyjny i nie uwzględniają współwystępowania predyktorów.
+
+```{r}
+#| label: tbl-ciagle
+#| tbl-cap: "Statystyki opisowe parametrów eksploatacyjnych na próbie treningowej"
+
+opisy <- c(
+  Temp_otoczenia = "Temperatura otoczenia [K]",
+  Temp_procesu = "Temperatura procesu [K]",
+  Predkosc = "Prędkość obrotowa [obr./min]",
+  Moment = "Moment obrotowy [Nm]",
+  Zuzycie = "Zużycie narzędzia [min]"
+)
+
+parametry <- names(opisy)
+stat_ciagle <- trening %>%
+  select(Awaria, all_of(parametry)) %>%
+  pivot_longer(cols = all_of(parametry),
+               names_to = "Parametr", values_to = "Wartosc") %>%
+  group_by(Awaria, Parametr) %>%
+  summarise(
+    Liczba = n(), Srednia = mean(Wartosc),
+    Mediana = median(Wartosc), SD = sd(Wartosc),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Parametr = unname(opisy[Parametr]),
+    across(c(Srednia, Mediana, SD), ~round(.x, 2))
+  )
+knitr::kable(stat_ciagle)
+```
+
+```{r}
+#| label: fig-parametry
+#| fig-cap: "Porównanie rozkładów pięciu parametrów w klasach awarii i braku awarii"
+#| fig-width: 12
+#| fig-height: 8
+
+trening %>%
+  select(Awaria, all_of(parametry)) %>%
+  pivot_longer(cols = all_of(parametry),
+               names_to = "Parametr", values_to = "Wartosc") %>%
+  mutate(Parametr = unname(opisy[Parametr])) %>%
+  ggplot(aes(x = Awaria, y = Wartosc, fill = Awaria)) +
+  geom_boxplot(outlier.alpha = 0.2, width = 0.55) +
+  facet_wrap(~Parametr, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = barwy) +
+  labs(x = "Stan maszyny", y = "Wartość parametru") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+```{r}
+#| label: tbl-testy-ciagle
+#| tbl-cap: "Wyniki testów Manna–Whitneya z korektą BH"
+
+testy_ciagle <- lapply(parametry, function(zmienna) {
+  wynik <- wilcox.test(trening[[zmienna]] ~ trening$Awaria,
+                       exact = FALSE)
+  data.frame(
+    Parametr = unname(opisy[zmienna]),
+    p = wynik$p.value
+  )
+})
+testy_ciagle <- do.call(rbind, testy_ciagle)
+testy_ciagle$p_BH <- p.adjust(testy_ciagle$p, method = "BH")
+knitr::kable(data.frame(
+  Parametr = testy_ciagle$Parametr,
+  `p (surowe)` = vapply(testy_ciagle$p, fmt_p, character(1)),
+  `p (BH)` = vapply(testy_ciagle$p_BH, fmt_p, character(1)),
+  check.names = FALSE
+))
+```
+
+Wartości \(p\) informują o zgodności danych z hipotezą zerową testu, a nie o sile praktycznej różnicy ani o przyczynowym wpływie parametru na awarię.
+
+# Budowa modelu
+
+Do estymacji modeli użyto `r nrow(trening)` rekordów treningowych (`r sum(trening$Awaria == "Awaria")` awarii), a do niezależnej oceny predykcji odłożono `r nrow(testowy)` rekordów (`r sum(testowy$Awaria == "Awaria")` awarii). Podział był warstwowy, dzięki czemu proporcje klas zostały zachowane.
+
+Przyjęto zestaw kolejnych, **zagnieżdżonych** modeli:
+
+- **M0** — model zerowy zawierający wyłącznie wyraz wolny;
+- **M1** — typ produktu oraz obie temperatury;
+- **M2** — M1 rozszerzony o prędkość obrotową i moment obrotowy;
+- **M3** — M2 rozszerzony o zużycie narzędzia.
+
+Taki układ umożliwia prawidłowe porównanie modeli testem ilorazu wiarygodności. Modele szacuje się na identycznej próbie treningowej.
+
+```{r}
+#| label: modele
+#| include: false
+
+m0 <- glm(Awaria ~ 1, data = trening, family = binomial())
+m1 <- glm(Awaria ~ Type + Temp_otoczenia + Temp_procesu,
+          data = trening, family = binomial())
+m2 <- glm(Awaria ~ Type + Temp_otoczenia + Temp_procesu +
+            Predkosc + Moment,
+          data = trening, family = binomial())
+m3 <- glm(Awaria ~ Type + Temp_otoczenia + Temp_procesu +
+            Predkosc + Moment + Zuzycie,
+          data = trening, family = binomial())
+modele <- list(M1 = m1, M2 = m2, M3 = m3)
+```
+
+# Porównanie modeli — kryterium AIC
+
+Kryterium informacyjne Akaikego uwzględnia dobroć dopasowania i karę za złożoność modelu. Obowiązuje zasada: **im mniejsze AIC, tym korzystniejszy kompromis między dopasowaniem a złożonością**. AIC porównujemy tylko dla modeli oszacowanych na tych samych obserwacjach [@hosmer].
+
+\[
+\mathrm{AIC}=-2\log L+2k,
+\]
+
+gdzie \(L\) oznacza maksymalną wiarygodność, a \(k\) liczbę estymowanych parametrów.
+
+```{r}
+#| label: tbl-aic
+#| tbl-cap: "Porównanie kandydatów na model końcowy według AIC"
+
+aic_wyniki <- data.frame(
+  Model = names(modele),
+  Parametry = vapply(modele, function(m) length(coef(m)), integer(1)),
+  AIC = vapply(modele, AIC, numeric(1))
+)
+aic_wyniki$Delta_AIC <- aic_wyniki$AIC - min(aic_wyniki$AIC)
+knitr::kable(aic_wyniki, digits = 2)
+```
+
+# Porównanie modeli — test ilorazu wiarygodności
+
+Test ilorazu wiarygodności (LR) sprawdza, czy dodanie nowej grupy predyktorów powoduje istotną poprawę dopasowania. Hipoteza zerowa dla pary modeli zagnieżdżonych zakłada, że dodatkowe współczynniki w modelu większym wynoszą zero.
+
+```{r}
+#| label: tbl-lrt
+#| tbl-cap: "Testy ilorazu wiarygodności dla zagnieżdżonych modeli"
+
+lrt <- anova(m1, m2, m3, test = "Chisq")
+knitr::kable(as.data.frame(lrt), digits = 4)
+```
+
+Test LR jest stosowany do **M1 względem M2** oraz **M2 względem M3**. Nie służy do bezpośredniego porównania modeli trenowanych na inaczej ważonych lub nadpróbkowanych danych.
+
+# Wybór modelu końcowego
+
+Jako model końcowy przyjęto model o najmniejszej wartości AIC spośród M1–M3, przy czym testy LR stanowią dodatkową informację o korzyściach z rozszerzania modelu.
+
+```{r}
+#| label: wybor-modelu
+#| include: false
+
+nazwa_final <- aic_wyniki$Model[which.min(aic_wyniki$AIC)]
+model_final <- modele[[nazwa_final]]
+```
+
+**Model wybrany na podstawie AIC:** `r nazwa_final`, z wartością AIC równą `r round(AIC(model_final), 2)`.
+
+```{r}
+#| label: tbl-wspolczynniki
+#| tbl-cap: "Estymatory współczynników i ilorazy szans modelu końcowego"
+
+wsp <- summary(model_final)$coefficients
+betas <- coef(model_final)
+se <- sqrt(diag(vcov(model_final)))
+ilorazy_szans <- data.frame(
+  Predyktor = names(betas),
+  Beta = unname(betas),
+  SE = unname(se),
+  OR = unname(exp(betas)),
+  OR_dol_95 = unname(exp(betas - 1.96 * se)),
+  OR_gora_95 = unname(exp(betas + 1.96 * se)),
+  p = unname(wsp[, 4])
+)
+knitr::kable(data.frame(
+  Predyktor = ilorazy_szans$Predyktor,
+  Beta = round(ilorazy_szans$Beta, 4),
+  OR = round(ilorazy_szans$OR, 3),
+  `OR — 95% dolna` = round(ilorazy_szans$OR_dol_95, 3),
+  `OR — 95% górna` = round(ilorazy_szans$OR_gora_95, 3),
+  p = vapply(ilorazy_szans$p, fmt_p, character(1)),
+  check.names = FALSE
+))
+```
+
+*Uwaga:* wartości \(p\) i przedziały ufności w modelu wybranym na podstawie tego samego zbioru mogą być nadmiernie optymistyczne. Wnioski inferencyjne należy traktować jako eksploracyjne.
+
+# Ocena dopasowania modelu końcowego
+
+Na danych treningowych podano dewiancję, logarytm wiarygodności, pseudo-\(R^2\) McFaddena i test LR względem modelu zerowego. Na odłożonych danych testowych oceniono błąd Briera i kalibrację prawdopodobieństw.
+
+```{r}
+#| label: ocena-modelu
+#| include: false
+
+lrt_global <- anova(m0, model_final, test = "Chisq")
+p_global <- lrt_global[2, "Pr(>Chi)"]
+chi_global <- lrt_global[2, "Deviance"]
+pseudo_r2 <- 1 - as.numeric(logLik(model_final) / logLik(m0))
+
+p_test <- as.numeric(predict(model_final, newdata = testowy,
+                             type = "response"))
+y_test <- as.integer(testowy$Awaria == "Awaria")
+brier <- mean((y_test - p_test)^2)
+
+# 10 grup o podobnej liczebności — wizualna ocena kalibracji
+kalibracja <- data.frame(
+  grupa = pmin(10L, ceiling(rank(p_test, ties.method = "first") /
+                              (length(p_test) / 10))),
+  przewidywane = p_test,
+  rzeczywiste = y_test
+) %>%
+  group_by(grupa) %>%
+  summarise(
+    Prognoza = mean(przewidywane),
+    Obserwacja = mean(rzeczywiste),
+    Liczba = n(), .groups = "drop"
+  )
+```
+
+```{r}
+#| label: tbl-dopasowanie
+#| tbl-cap: "Miary dopasowania i kalibracji modelu końcowego"
+
+miary_dopasowania <- data.frame(
+  Miara = c("AIC (trening)", "Dewiancja resztowa (trening)",
+            "McFadden pseudo-R² (trening)",
+            "Test LR względem modelu zerowego — p",
+            "Brier score (test)"),
+  Wartosc = c(
+    sprintf("%.3f", AIC(model_final)),
+    sprintf("%.3f", deviance(model_final)),
+    sprintf("%.3f", pseudo_r2),
+    fmt_p(p_global),
+    sprintf("%.4f", brier)
+  )
+)
+knitr::kable(miary_dopasowania)
+```
+
+```{r}
+#| label: fig-kalibracja
+#| fig-cap: "Kalibracja modelu na próbie testowej (10 grup o podobnej liczebności)"
+
+ggplot(kalibracja, aes(x = Prognoza, y = Obserwacja)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey55") +
+  geom_point(size = 2.5, color = "#277A72") +
+  geom_line(color = "#277A72") +
+  labs(x = "Średnie prawdopodobieństwo prognozowane",
+       y = "Obserwowany odsetek awarii") +
+  coord_equal() +
+  theme_minimal(base_size = 12)
+```
+
+Dopasowanie do próby treningowej nie jest tym samym co zdolność generalizacji. Ocena testowa stanowi odrębny etap, którego wyniki podano poniżej.
+
+# Miary ogólne
+
+Do klasyfikacji zastosowano umowny próg prawdopodobieństwa 0,5. Przy bardzo rzadkich awariach próg ten może ograniczać czułość i nie jest z definicji optymalny dla zastosowań przemysłowych.
+
+```{r}
+#| label: miary-klasyfikacji
+#| include: false
+
+klasy <- c("Brak awarii", "Awaria")
+klasa_test <- factor(ifelse(p_test >= 0.5, "Awaria", "Brak awarii"),
+                     levels = klasy)
+macierz <- table(Rzeczywiste = testowy$Awaria,
+                 Przewidywane = klasa_test)
+TP <- unname(macierz["Awaria", "Awaria"])
+TN <- unname(macierz["Brak awarii", "Brak awarii"])
+FP <- unname(macierz["Brak awarii", "Awaria"])
+FN <- unname(macierz["Awaria", "Brak awarii"])
+
+accuracy <- (TP + TN) / sum(macierz)
+precision <- bezpieczny_ulamek(TP, TP + FP)
+recall <- bezpieczny_ulamek(TP, TP + FN)
+specificity <- bezpieczny_ulamek(TN, TN + FP)
+f1 <- bezpieczny_ulamek(2 * TP, 2 * TP + FP + FN)
+balanced_accuracy <- (recall + specificity) / 2
+ap <- average_precision(testowy$Awaria, p_test)
+roc_obj <- pROC::roc(
+  response = testowy$Awaria, predictor = p_test,
+  levels = c("Brak awarii", "Awaria"), direction = "<", quiet = TRUE
+)
+auc_roc <- as.numeric(pROC::auc(roc_obj))
+```
+
+```{r}
+#| label: tbl-miary
+#| tbl-cap: "Miary skuteczności modelu na zbiorze testowym"
+
+miary <- data.frame(
+  Miara = c("Accuracy", "Precision", "Recall (czułość)",
+            "Specificity (swoistość)", "F1", "Balanced accuracy",
+            "ROC-AUC", "Average precision (AP)",
+            "Udział awarii — poziom odniesienia AP"),
+  Wartosc = round(c(
+    accuracy, precision, recall, specificity, f1,
+    balanced_accuracy, auc_roc, ap, mean(y_test)
+  ), 4)
+)
+knitr::kable(miary)
+```
+
+Accuracy przedstawiono dla kompletności, natomiast szczególną uwagę poświęcono recall (odsetkowi rozpoznanych awarii), precision (wiarygodności alarmów) oraz AP — miarze uwzględniającej rzadkość klasy dodatniej.
+
+# Macierz pomyłek
+
+```{r}
+#| label: tbl-macierz
+#| tbl-cap: "Macierz pomyłek na danych testowych, próg klasyfikacji 0,5"
+
+knitr::kable(as.data.frame.matrix(macierz))
+```
+
+```{r}
+#| label: fig-macierz
+#| fig-cap: "Macierz pomyłek na danych testowych"
+
+df_mac <- as.data.frame(macierz)
+ggplot(df_mac, aes(x = Przewidywane, y = Rzeczywiste, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 5) +
+  scale_fill_gradient(low = "#E8F3F1", high = "#277A72") +
+  labs(x = "Klasa przewidywana", y = "Klasa rzeczywista", fill = "Liczba") +
+  theme_minimal(base_size = 12)
+```
+
+Model prawidłowo rozpoznał `r TP` awarii, pominął `r FN` awarii, wygenerował `r FP` fałszywych alarmów i poprawnie rozpoznał `r TN` przypadków bez awarii. Praktyczna ocena tych błędów wymaga uwzględnienia kosztu przestoju i kosztu fałszywego alarmu.
+
+# Krzywa ROC i AUC
+
+Krzywa ROC przedstawia czułość względem odsetka fałszywie dodatnich rozpoznań (1 − swoistość) dla kolejnych progów decyzyjnych. Pole pod krzywą ROC (AUC) mierzy zdolność modelu do rangowania obserwacji [@fawcett].
+
+```{r}
+#| label: fig-roc
+#| fig-cap: "Krzywa ROC modelu końcowego na zbiorze testowym"
+#| fig-width: 7
+#| fig-height: 6
+
+roc_df <- data.frame(
+  FPR = 1 - roc_obj$specificities,
+  TPR = roc_obj$sensitivities
+)
+roc_df <- roc_df[order(roc_df$FPR, roc_df$TPR), , drop = FALSE]
+ggplot(roc_df, aes(x = FPR, y = TPR)) +
+  geom_line(color = "#277A72", linewidth = 1.05) +
+  geom_abline(intercept = 0, slope = 1,
+              linetype = "dashed", color = "grey55") +
+  coord_equal() +
+  labs(x = "1 − swoistość (FPR)", y = "Czułość (TPR)",
+       title = paste0("ROC-AUC = ", round(auc_roc, 3))) +
+  theme_minimal(base_size = 12)
+```
+
+Wartość AUC wynosi `r round(auc_roc, 3)`. Wysokie ROC-AUC nie musi oznaczać wysokiej precyzji wykrywania rzadkich awarii, dlatego przedstawiono również AP.
+
+# Sprawdzanie założeń
+
+Podstawowe kwestie obejmują: binarną zmienną objaśnianą, brak doskonałej współliniowości predyktorów, odpowiednią liczbę awarii względem złożoności modelu, sensowność liniowej zależności predyktorów liczbowych w skali logitu oraz niezależność obserwacji. W zbiorze syntetycznym niezależności rekordów nie da się potwierdzić na podstawie samych wartości tabelarycznych.
+
+## Współliniowość predyktorów (VIF)
+
+Dla predyktorów modelu obliczono uogólniony czynnik inflacji wariancji (GVIF). Przy zmiennej kategorycznej o trzech poziomach (`Type`) raportujemy także \(\mathrm{GVIF}^{1/(2\cdot df)}\) — miarę skorygowaną o liczbę stopni swobody. Progi oceny są orientacyjne, nie bezwzględne.
+
+```{r}
+#| label: tbl-vif
+#| tbl-cap: "Współliniowość predyktorów modelu końcowego — GVIF"
+
+# Wzór oparty na macierzy korelacji kolumn model.matrix;
+# dla składnika z jednym parametrem GVIF jest zwykłym VIF.
+oblicz_gvif <- function(mod) {
+  macierz_x <- model.matrix(mod)
+  przydzial <- attr(macierz_x, "assign")[-1]
+  x <- macierz_x[, -1, drop = FALSE]
+  R <- cor(x)
+  wyznacznik_log <- function(M) {
+    as.numeric(determinant(M, logarithm = TRUE)$modulus)
+  }
+  log_det_R <- wyznacznik_log(R)
+  nazwy <- attr(terms(mod), "term.labels")
+  result <- lapply(seq_along(nazwy), function(j) {
+    indeks <- which(przydzial == j)
+    pozostale <- setdiff(seq_len(ncol(x)), indeks)
+    d <- length(indeks)
+    czesc <- wyznacznik_log(R[indeks, indeks, drop = FALSE])
+    if (length(pozostale) > 0) {
+      czesc <- czesc + wyznacznik_log(
+        R[pozostale, pozostale, drop = FALSE]
+      )
+    }
+    gvif <- exp(czesc - log_det_R)
+    data.frame(Predyktor = nazwy[j], df = d,
+               GVIF = gvif, GVIF_korygowany = gvif^(1/(2*d)))
+  })
+  do.call(rbind, result)
+}
+
+tabela_vif <- oblicz_gvif(model_final)
+knitr::kable(tabela_vif, digits = 3)
+```
+
+Dla predyktorów o jednym stopniu swobody można odwołać się do zwykłego VIF; dla `Type` właściwszy jest skorygowany GVIF. Ponieważ temperatury procesu i otoczenia mogą być silnie skorelowane, ich współczynniki należy interpretować ostrożnie.
+
+## Reguła kciuka — liczba zdarzeń na parametr
+
+Historyczna reguła EPV (*events per variable/parameter*) sugerowała około 10 zdarzeń na estymowany parametr [@peduzzi]. Nie jest to jednak uniwersalna gwarancja poprawności modelu; współczesne opracowania zalecają ocenę liczebności w kontekście złożoności, częstości zdarzeń i oczekiwanej jakości modelu [@riley].
+
+```{r}
+#| label: tbl-epv
+#| tbl-cap: "Liczba zdarzeń przypadających na parametr modelu końcowego"
+
+liczba_zdarzen_trening <- sum(trening$Awaria == "Awaria")
+liczba_parametrow <- length(coef(model_final)) - 1
+EPV <- liczba_zdarzen_trening / liczba_parametrow
+knitr::kable(data.frame(
+  Liczba_awarii_trening = liczba_zdarzen_trening,
+  Parametry_bez_interceptu = liczba_parametrow,
+  EPV = round(EPV, 2)
+))
+```
+
+Przy `r liczba_zdarzen_trening` awariach w próbie treningowej i `r liczba_parametrow` parametrach poza wyrazem wolnym współczynnik EPV wynosi `r round(EPV, 1)`.
+
+## Dodatkowe ograniczenia założeń
+
+Model addytywny zakłada liniowy związek każdej zmiennej liczbowej z logitem prawdopodobieństwa awarii, o ile nie wprowadzono transformacji. Charakter awarii może być jednak progowy lub nieliniowy; interpretacja współczynników ma zatem charakter **warunkowy względem tej specyfikacji**. Ewentualne rozwinięcie badania powinno objąć splajny i interakcje, np. między prędkością obrotową i momentem obrotowym, wraz z ponowną walidacją.
+
+# Interpretacja parametrów modelu
+
+Współczynniki \(\beta\) opisują zmianę logarytmu szans awarii, a \(\exp(\beta)\) — odpowiedni iloraz szans (OR). Wartości OR większe od 1 oznaczają wzrost szans, a mniejsze od 1 spadek szans, przy założeniu stałości pozostałych predyktorów. Nie jest to automatycznie zmiana prawdopodobieństwa o ten sam procent.
+
+Dla kategorii `TypeM` i `TypeH` porównaniem jest typ L. Dla zmiennych ilościowych wynik OR dotyczy jednostkowej zmiany, dlatego w kolejnym podrozdziale pokazano także praktyczne przyrosty, np. 100 obr./min lub 10 Nm.
+
+# Interpretacja poszczególnych efektów
+
+```{r}
+#| label: tbl-efekty
+#| tbl-cap: "Ilorazy szans dla wybranych, praktycznych przyrostów parametrów"
+
+# Skala zmian dobierana do jednostki i znaczenia technicznego.
+skale <- c(
+  TypeM = 1, TypeH = 1,
+  Temp_otoczenia = 1,
+  Temp_procesu = 1,
+  Predkosc = 100,
+  Moment = 10,
+  Zuzycie = 10
+)
+opis_efektu <- c(
+  TypeM = "Typ M względem L",
+  TypeH = "Typ H względem L",
+  Temp_otoczenia = "+1 K temperatury otoczenia",
+  Temp_procesu = "+1 K temperatury procesu",
+  Predkosc = "+100 obr./min",
+  Moment = "+10 Nm",
+  Zuzycie = "+10 min zużycia narzędzia"
+)
+
+nazwy_wsp <- setdiff(names(betas), "(Intercept)")
+przyrosty <- unname(skale[nazwy_wsp])
+wsp_efekty <- unname(betas[nazwy_wsp])
+se_efekty <- unname(se[nazwy_wsp])
+tabela_efekty <- data.frame(
+  Zmiana = unname(opis_efektu[nazwy_wsp]),
+  OR = exp(wsp_efekty * przyrosty),
+  Dolny_95 = exp((wsp_efekty - 1.96 * se_efekty) * przyrosty),
+  Gorny_95 = exp((wsp_efekty + 1.96 * se_efekty) * przyrosty)
+)
+knitr::kable(tabela_efekty, digits = 3)
+```
+
+Wszystkie wartości w tabeli odnoszą się do **szans awarii przy pozostałych zmiennych stałych**, nie zaś do bezpośredniego wzrostu odsetka awarii. Wartości OR są wrażliwe na postać modelu i współliniowość predyktorów. Interpretacja w kategoriach przyczynowego wpływu wymagałaby dodatkowych założeń i odrębnego projektu badawczego.
+
+# Dyskusja
+
+Analiza wykorzystuje syntetyczne dane odpowiadające charakterystykom udostępnionym przez repozytorium UCI. W modelu końcowym wybranym na podstawie AIC uwzględniono następujące składniki: **`r paste(attr(terms(model_final), "term.labels"), collapse = ", ")`**.
+
+Otrzymano AUC = **`r round(auc_roc, 3)`**, czułość przy progu 0,5 = **`r round(recall, 3)`** oraz precyzję = **`r ifelse(is.na(precision), "nieokreślona (brak alarmów)", as.character(round(precision, 3)))`**. Ocena praktyczna wymaga odniesienia liczby pominiętych awarii do kosztów przestoju oraz fałszywych alarmów do kosztów niepotrzebnych przeglądów.
+
+Ważnymi ograniczeniami są: syntetyczny mechanizm tworzenia danych, silne niezbalansowanie klas, możliwe nieliniowe związki między parametrami a etykietą awarii, ryzyko współliniowości temperatur, jednorazowy podział trening/test oraz optymizm inferencji po doborze modelu na podstawie AIC. Analiza powinna zostać rozszerzona w kolejnych badaniach o walidację krzyżową lub bootstrap, modelowanie zależności nieliniowych oraz ocenę kalibracji.
+
+Techniki równoważenia klas (np. wagi klas lub SMOTENC) można porównać w osobnym eksperymencie predykcyjnym. **Nie stosowano SMOTENC do podstawowego wnioskowania o współczynnikach i OR**, ponieważ syntetyczne nadpróbkowanie zmienia rozkład treningowy i utrudnia interpretację zależności w oryginalnej populacji danych.
+
+# Wnioski
+
+1. W oryginalnym zbiorze odsetek awarii wynosi **`r round(100 * liczba_awarii / nrow(dane), 2)`%**, co uzasadnia zastosowanie miar innych niż sama dokładność klasyfikacji.
+2. Wśród badanych, uprzednio zdefiniowanych kandydatów najniższą wartość AIC uzyskał model **`r nazwa_final`**. Dobór ten dotyczy dopasowania na próbie treningowej, a nie jest dowodem przyczynowości.
+3. Końcowy model uzyskał **ROC-AUC = `r round(auc_roc, 3)`** oraz **AP = `r round(ap, 3)`** na próbie testowej. Skuteczność należy rozpatrywać z uwzględnieniem fałszywych alarmów i pominiętych awarii.
+4. Interpretacja współczynników jako ilorazów szans jest możliwa, lecz zależy od specyfikacji liniowej modelu oraz współzależności predyktorów.
+5. Wnioski dotyczą **syntetycznego zbioru AI4I 2020**. Przed wdrożeniem modelu w systemie przemysłowym konieczna byłaby walidacja na rzeczywistych danych eksploatacyjnych.
+
+# Bibliografia
+
+::: {#refs}
+:::
